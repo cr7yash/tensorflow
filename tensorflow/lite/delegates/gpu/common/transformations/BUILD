@@ -1,6 +1,7 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])  # Apache 2.0
+package(
+    default_visibility = ["//visibility:public"],
+    licenses = ["notice"],  # Apache 2.0
+)
 
 cc_library(
     name = "add_bias",
@@ -15,6 +16,37 @@ cc_library(
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:any",
+    ],
+)
+
+cc_library(
+    name = "add_quant_adjustments",
+    srcs = ["add_quant_adjustments.cc"],
+    hdrs = ["add_quant_adjustments.h"],
+    deps = [
+        "//tensorflow/lite/delegates/gpu/common:data_type",
+        "//tensorflow/lite/delegates/gpu/common:model",
+        "//tensorflow/lite/delegates/gpu/common:model_transformer",
+        "//tensorflow/lite/delegates/gpu/common:operations",
+        "//tensorflow/lite/delegates/gpu/common:status",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:any",
+    ],
+)
+
+cc_test(
+    name = "add_quant_adjustments_test",
+    srcs = ["add_quant_adjustments_test.cc"],
+    deps = [
+        ":add_quant_adjustments",
+        "//tensorflow/lite/delegates/gpu/common:model",
+        "//tensorflow/lite/delegates/gpu/common:model_transformer",
+        "//tensorflow/lite/delegates/gpu/common:operations",
+        "//tensorflow/lite/delegates/gpu/common:shape",
+        "@com_google_absl//absl/types:any",
+        "@com_google_absl//absl/types:optional",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -73,6 +105,7 @@ cc_library(
     srcs = ["general_transformations.cc"],
     hdrs = ["general_transformations.h"],
     deps = [
+        ":add_quant_adjustments",
         ":fuse_add_to_conv",
         ":fuse_mul_to_conv",
         ":make_fully_connected",

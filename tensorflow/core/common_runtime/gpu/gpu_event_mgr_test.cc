@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #include "tensorflow/core/common_runtime/gpu/gpu_event_mgr.h"
 
@@ -28,7 +28,6 @@ limitations under the License.
 #include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/lib/core/notification.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
-#include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/platform/stream_executor.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/test_benchmark.h"
@@ -36,6 +35,13 @@ limitations under the License.
 #include "tensorflow/core/public/version.h"
 
 namespace tensorflow {
+
+// Subclass EventMgr to access its private constructor.
+class TEST_EventMgr : public EventMgr {
+ public:
+  TEST_EventMgr(se::StreamExecutor* se, const GPUOptions& gpu_options)
+      : EventMgr(se, gpu_options) {}
+};
 
 class TEST_EventMgrHelper {
  public:
@@ -57,12 +63,7 @@ class TEST_EventMgrHelper {
     return em_->free_events_.size();
   }
 
-  void QueueTensors(se::Stream* stream, TensorReferenceVector* tensors) {
-    mutex_lock l(em_->mu_);
-    em_->QueueTensors(stream, tensors);
-  }
-
-  void PollEvents(bool is_dedicated_poller) {
+  void PollEvents() {
     while (queue_size() > 0) {
       // For ordinary tensor frees, this function
       // should synchronously harvest all complete
@@ -70,15 +71,15 @@ class TEST_EventMgrHelper {
       EventMgr::ToFreeVector to_free;
       {
         mutex_lock l(em_->mu_);
-        em_->PollEvents(is_dedicated_poller, &to_free);
+        em_->PollEvents(true, &to_free);
       }
       em_->FreeMemory(to_free);
     }
   }
 
-  void StopPollingLoop() { em_->StopPollingLoop(); }
+  void StopPollingLoop() { return em_->StopPollingLoop(); }
 
-  void StartPollingLoop() { em_->StartPollingLoop(); }
+  void StartPollingLoop() { return em_->StartPollingLoop(); }
 
  private:
   EventMgr* em_;
@@ -109,161 +110,22 @@ namespace {
 
 TEST(EventMgr, Empty) {
   auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
+  TEST_EventMgr em(stream_exec, GPUOptions());
   TEST_EventMgrHelper th(&em);
   EXPECT_EQ(0, th.queue_size());
   EXPECT_EQ(0, th.free_size());
-}
-
-static void AddTensorReference(TensorReferenceVector* v, int64 size) {
-  TestTensorBuffer* buf = new TestTensorBuffer(size);
-  v->push_back(TensorReference(buf));
-  buf->Unref();
-}
-
-// Delaying polling until after several enqueings should grow the
-// total number of allocated events.  Once we have enough events for
-// the max simultaneously pending, we should not allocate any more.
-TEST(EventMgr, DelayedPolling) {
-  auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
-  TEST_EventMgrHelper th(&em);
-  EXPECT_EQ(0, th.queue_size());
-  TensorReferenceVector* v = nullptr;
-  std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
-  CHECK(stream);
-  stream->Init();
-  for (int i = 0; i < 5; ++i) {
-    v = new TensorReferenceVector;
-    AddTensorReference(v, 100 * 1048576);
-    th.QueueTensors(stream.get(), v);
-    EXPECT_EQ(i + 1, th.queue_size());
-    EXPECT_EQ(0, th.free_size());
-  }
-  th.PollEvents(false);
-  EXPECT_EQ(0, th.queue_size());
-  EXPECT_EQ(5, th.free_size());
-  for (int j = 0; j < 2; ++j) {
-    for (int i = 0; i < 5; ++i) {
-      v = new TensorReferenceVector;
-      AddTensorReference(v, 100 * 1048576);
-      th.QueueTensors(stream.get(), v);
-      EXPECT_EQ(i + 1, th.queue_size());
-      EXPECT_EQ(4 - i, th.free_size());
-    }
-    th.PollEvents(false);
-    EXPECT_EQ(0, th.queue_size());
-    EXPECT_EQ(5, th.free_size());
-  }
-}
-
-TEST(EventMgr, FlushLargeTensorImmediately) {
-  auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
-  TEST_EventMgrHelper th(&em);
-  EXPECT_EQ(0, live_tensor_bytes);
-  std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
-  CHECK(stream);
-  stream->Init();
-  for (int i = 0; i < 5; ++i) {
-    TensorReferenceVector v;
-    AddTensorReference(&v, 100 * 1048576);
-    em.ThenDeleteTensors(stream.get(), v);
-    th.PollEvents(false);  // Ensure things get registered to be freed by Poll
-    EXPECT_EQ(0, live_tensor_bytes);
-  }
-}
-
-TEST(EventMgr, ManySmallTensorsFlushedImmediately) {
-  auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
-  TEST_EventMgrHelper th(&em);
-  EXPECT_EQ(0, live_tensor_bytes);
-  std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
-  CHECK(stream);
-  stream->Init();
-  for (int i = 0; i < 5; ++i) {
-    TensorReferenceVector v;
-    for (int i = 0; i < 1000; i++) {
-      AddTensorReference(&v, 100 * 1024);
-    }
-    em.ThenDeleteTensors(stream.get(), v);
-    th.PollEvents(false);  // Harvest the tensors ready to be freed.
-    EXPECT_EQ(0, live_tensor_bytes);
-  }
-}
-
-TEST(EventMgr, StreamSwitchingFlushesImmediately) {
-  auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
-  TEST_EventMgrHelper th(&em);
-  EXPECT_EQ(0, live_tensor_bytes);
-  std::unique_ptr<se::Stream> stream1(new se::Stream(stream_exec));
-  std::unique_ptr<se::Stream> stream2(new se::Stream(stream_exec));
-  stream1->Init();
-  stream2->Init();
-  TensorReferenceVector v1;
-  AddTensorReference(&v1, 1024);
-  em.ThenDeleteTensors(stream1.get(), v1);
-
-  TensorReferenceVector v2;
-  AddTensorReference(&v2, 1024);
-  int64 initial_live_bytes = live_tensor_bytes;
-  em.ThenDeleteTensors(stream2.get(), v2);
-  th.PollEvents(false);  // Ensure things get registered to be freed by Poll
-  // Different stream should cause first tensor to get deleted
-  EXPECT_GT(initial_live_bytes, live_tensor_bytes);
-}
-
-TEST(EventMgr, ManySmallTensorsSeparateCallsFlushed) {
-  auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
-  TEST_EventMgrHelper th(&em);
-  EXPECT_EQ(0, live_tensor_bytes);
-  std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
-  CHECK(stream);
-  stream->Init();
-  for (int i = 0; i < 5; ++i) {
-    for (int i = 0; i < 1000; i++) {
-      TensorReferenceVector v;
-      AddTensorReference(&v, 100 * 1024);
-      em.ThenDeleteTensors(stream.get(), v);
-    }
-    th.PollEvents(false);  // Ensure things get registered to be freed by Poll
-    // Some of the tensors at least should be flushed
-    EXPECT_GT(1000 * 100 * 1024, live_tensor_bytes);
-  }
-}
-
-// Deleting the EventMgr when events are still pending should shut
-// down gracefully.
-TEST(EventMgr, NonEmptyShutdown) {
-  auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
-  TEST_EventMgrHelper th(&em);
-  EXPECT_EQ(0, th.queue_size());
-  EXPECT_EQ(0, th.free_size());
-  std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
-  CHECK(stream);
-  stream->Init();
-  for (int i = 0; i < 5; ++i) {
-    TensorReferenceVector* v = new TensorReferenceVector;
-    AddTensorReference(v, 100 * 1048576);
-    th.QueueTensors(stream.get(), v);
-    EXPECT_EQ(1 + i, th.queue_size());
-    EXPECT_EQ(0, th.free_size());
-  }
 }
 
 // Tests that WarnIfInCallback() triggers correctly.
 TEST(EventMgr, WarnIfInCallback) {
   auto stream_exec = GPUMachineManager()->ExecutorForDevice(0).ValueOrDie();
-  EventMgr em(stream_exec, GPUOptions());
+  TEST_EventMgr em(stream_exec, GPUOptions());
   TEST_EventMgrHelper th(&em);
   std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
   CHECK(stream);
   stream->Init();
   bool hit = false;
+  th.StartPollingLoop();
   gpu_event_mgr::WarnIfInCallback([&hit] { hit = true; });
   EXPECT_FALSE(hit);
   Notification note;
@@ -281,7 +143,7 @@ TEST(EventMgr, WarnIfInCallback) {
 // Provides access to private resources of BaseGPUDevice.
 class GPUDeviceTestHelper {
  public:
-  GPUDeviceTestHelper(size_t memory_limit) {
+  GPUDeviceTestHelper(size_t memory_limit, int pending_cap) {
     SessionOptions sops;
     device_ =
         DeviceFactory::NewDevice(DEVICE_GPU, sops, "/job:a/replica:0/task:0");
@@ -294,11 +156,12 @@ class GPUDeviceTestHelper {
   BaseGPUDevice* gpu() { return gpu_.get(); }
   Allocator* gpu_allocator() { return gpu_allocator_; }
   Allocator* host_allocator() { return host_allocator_; }
-  se::Stream* compute_stream() { return gpu_->streams_[0]->compute; }
-  se::Stream* h2d_stream() { return gpu_->streams_[0]->host_to_device; }
-  se::Stream* d2h_stream() { return gpu_->streams_[0]->device_to_host; }
-  se::Stream* d2d_stream() { return gpu_->streams_[0]->device_to_device[0]; }
-  EventMgr* event_mgr() { return gpu_->em_.get(); }
+  se::Stream* compute_stream() { return gpu_->stream_->compute; }
+  se::Stream* h2d_stream() { return gpu_->stream_->host_to_device; }
+  se::Stream* d2h_stream() { return gpu_->stream_->device_to_host; }
+  se::Stream* d2d_stream() { return gpu_->stream_->device_to_device[0]; }
+  EventMgr* event_mgr() { return gpu_->em_; }
+  int pending_cap() { return gpu_->pending_cap_; }
 
  private:
   std::unique_ptr<Device> device_;
@@ -328,7 +191,7 @@ class EMBenchmarkHelper {
 
  public:
   // Length of tensors.  TODO(tucker): make this a variable parameter.
-  static const int kTDim = 1024;
+  static constexpr int kTDim = 1024;
 
   int num_ops() const { return add_kernels_.size(); }
   size_t tensor_size() const {
@@ -340,23 +203,23 @@ class EMBenchmarkHelper {
 
   EMBenchmarkHelper(GPUDeviceTestHelper* h) : gpu_helper_(h) {}
 
-  void ReInit(int num_ops) {
+  void ReInit(int num_ops, int tensor_size) {
     gpu_inputs_.clear();
     while (gpu_inputs_.size() < 2) {
       gpu_inputs_.push_back(Tensor(gpu_helper_->gpu_allocator(), DT_FLOAT,
-                                   {kTDim}, AllocationAttributes()));
+                                   {tensor_size}, AllocationAttributes()));
     }
     gpu_outputs_.clear();
     while (gpu_outputs_.size() < 1) {
       gpu_outputs_.push_back(Tensor(gpu_helper_->gpu_allocator(), DT_FLOAT,
-                                    {kTDim}, AllocationAttributes()));
+                                    {tensor_size}, AllocationAttributes()));
     }
     host_inputs_.clear();
     while (host_inputs_.size() < 2) {
       int instance_index = host_inputs_.size();
       host_inputs_.push_back(Tensor(gpu_helper_->host_allocator(), DT_FLOAT,
-                                    {kTDim}, AllocationAttributes()));
-      for (int i = 0; i < kTDim; ++i) {
+                                    {tensor_size}, AllocationAttributes()));
+      for (int i = 0; i < tensor_size; ++i) {
         host_inputs_.back().flat<float>()(i) =
             i * (1.0 + (0.5 * instance_index));
       }
@@ -364,8 +227,8 @@ class EMBenchmarkHelper {
     host_outputs_.clear();
     while (host_outputs_.size() < 1) {
       host_outputs_.push_back(Tensor(gpu_helper_->host_allocator(), DT_FLOAT,
-                                     {kTDim}, AllocationAttributes()));
-      for (int i = 0; i < kTDim; ++i) {
+                                     {tensor_size}, AllocationAttributes()));
+      for (int i = 0; i < tensor_size; ++i) {
         host_outputs_.back().flat<float>()(i) = -1;
       }
     }
@@ -408,7 +271,7 @@ class EMBenchmarkHelper {
       attr.set_on_host(on_host);
       attrs->push_back(attr);
     }
-    params->output_attr_array = gtl::vector_as_array(attrs);
+    params->output_attr_array = attrs->data();
     params->forward_from_array = {};
   }
 
@@ -418,7 +281,6 @@ class EMBenchmarkHelper {
     params->step_id = 1;
     params->device = gpu_helper_->gpu();
     params->log_memory = false;
-    params->record_tensor_accesses = false;
     params->rendezvous = nullptr;
     params->collective_executor = nullptr;
     params->session_state = nullptr;  // ???
@@ -433,7 +295,6 @@ class EMBenchmarkHelper {
 
     params->step_container = nullptr;
     params->slice_reader_cache = nullptr;
-    params->input_device_contexts = nullptr;
     params->resource_manager = gpu_helper_->gpu()->resource_manager();
 
     params->stats_collector = nullptr;
@@ -583,7 +444,7 @@ static void BM_no_ops(int iters, int threads) {
   std::unique_ptr<se::Stream> stream(new se::Stream(stream_exec));
   CHECK(stream);
   stream->Init();
-  EventMgr em(stream_exec, GPUOptions());  //, stream.get());
+  TEST_EventMgr em(stream_exec, GPUOptions());
   testing::StartTiming();
   std::atomic<int> counter;
   counter.store(0, std::memory_order_seq_cst);
@@ -615,10 +476,11 @@ EMBenchmarkHelper* bm_helper = nullptr;
 mutex helper_mu;
 
 #ifdef PLATFORM_GOOGLE
-static void BM_chain_ops(int iters, int adds_per_round, bool event_after_add) {
+static void BM_chain_ops(int iters, int tensor_size, int adds_per_round,
+                         bool event_after_add, int pending_cap) {
 #else
-static void BM_chain_ops(int iters, int adds_per_round, bool event_after_add,
-                         int threads) {
+static void BM_chain_ops(int iters, int tensor_size, int adds_per_round,
+                         bool event_after_add, int pending_cap, int threads) {
 #endif
   testing::StopTiming();
 #ifdef PLATFORM_GOOGLE
@@ -628,12 +490,19 @@ static void BM_chain_ops(int iters, int adds_per_round, bool event_after_add,
 #endif  // PLATFORM_GOOGLE
   {
     mutex_lock l(helper_mu);
+    if (gpu_helper && gpu_helper->pending_cap() != pending_cap) {
+      delete bm_helper;
+      bm_helper = nullptr;
+      delete gpu_helper;
+      gpu_helper = nullptr;
+    }
     if (!gpu_helper) {
-      gpu_helper = new GPUDeviceTestHelper(1 << 20);
+      gpu_helper = new GPUDeviceTestHelper(1 << 24, pending_cap);
       bm_helper = new EMBenchmarkHelper(gpu_helper);
     }
-    if (bm_helper->num_ops() != adds_per_round) {
-      bm_helper->ReInit(adds_per_round);
+    if (bm_helper->num_ops() != adds_per_round ||
+        bm_helper->tensor_size() != tensor_size) {
+      bm_helper->ReInit(adds_per_round, tensor_size);
     }
   }
   std::vector<EMBenchmarkHelper::TimeSet> times;
@@ -648,7 +517,7 @@ static void BM_chain_ops(int iters, int adds_per_round, bool event_after_add,
   // First iter is always slow, so do one prior to the timed loop.
   int expected = 1 + (event_after_add ? adds_per_round : 0);
   bm_helper->DoAddChain(adds_per_round, 1, event_after_add, callback, nullptr);
-  while (counter < 1) {
+  while (counter < expected) {
     Env::Default()->SleepForMicroseconds(1);
   }
   counter = 0;
@@ -677,73 +546,171 @@ static void BM_chain_ops(int iters, int adds_per_round, bool event_after_add,
 }
 
 #ifdef PLATFORM_GOOGLE
-static void BM_chain_1_false(int iters) { BM_chain_ops(iters, 1, false); }
+static void BM_chain_1024_1_false(int iters) {
+  BM_chain_ops(iters, 1024, 1, false, 0);
+}
 
-static void BM_chain_1_true(int iters) { BM_chain_ops(iters, 1, true); }
+static void BM_chain_1024_1_true(int iters) {
+  BM_chain_ops(iters, 1024, 1, true, 0);
+}
 
-static void BM_chain_10_false(int iters) { BM_chain_ops(iters, 10, false); }
+static void BM_chain_1024_10_false(int iters) {
+  BM_chain_ops(iters, 1024, 10, false, 0);
+}
 
-static void BM_chain_10_true(int iters) { BM_chain_ops(iters, 10, true); }
+static void BM_chain_1024_10_true(int iters) {
+  BM_chain_ops(iters, 1024, 10, true, 0);
+}
 
-static void BM_chain_100_false(int iters) { BM_chain_ops(iters, 100, false); }
+static void BM_chain_1024_100_false(int iters) {
+  BM_chain_ops(iters, 1024, 100, false, 0);
+}
 
-static void BM_chain_100_true(int iters) { BM_chain_ops(iters, 100, true); }
+static void BM_chain_1024_100_true(int iters) {
+  BM_chain_ops(iters, 1024, 100, true, 0);
+}
 
-BENCHMARK(BM_chain_1_false)->Threads(1);
-BENCHMARK(BM_chain_1_true)->Threads(1);
-BENCHMARK(BM_chain_1_false)->Threads(2);
-BENCHMARK(BM_chain_1_true)->Threads(2);
-BENCHMARK(BM_chain_1_false)->Threads(8);
-BENCHMARK(BM_chain_1_true)->Threads(8);
-BENCHMARK(BM_chain_10_false)->Threads(1);
-BENCHMARK(BM_chain_10_true)->Threads(1);
-BENCHMARK(BM_chain_10_false)->Threads(8);
-BENCHMARK(BM_chain_10_true)->Threads(8);
-BENCHMARK(BM_chain_100_false)->Threads(1);
-BENCHMARK(BM_chain_100_true)->Threads(1);
-BENCHMARK(BM_chain_100_false)->Threads(8);
-BENCHMARK(BM_chain_100_true)->Threads(8);
+static void BM_chain_1M_1_false(int iters) {
+  BM_chain_ops(iters, 1 << 20, 1, false, 0);
+}
+
+static void BM_chain_1M_1_true(int iters) {
+  BM_chain_ops(iters, 1 << 20, 1, true, 0);
+}
+
+static void BM_chain_1M_10_false(int iters) {
+  BM_chain_ops(iters, 1 << 20, 10, false, 0);
+}
+
+static void BM_chain_1M_10_true(int iters) {
+  BM_chain_ops(iters, 1 << 20, 10, true, 0);
+}
+
+static void BM_chain_1M_100_false(int iters) {
+  BM_chain_ops(iters, 1 << 20, 100, false, 0);
+}
+
+static void BM_chain_1M_100_true(int iters) {
+  BM_chain_ops(iters, 1 << 20, 100, true, 0);
+}
+
+BENCHMARK(BM_chain_1024_1_false)->Threads(1);
+BENCHMARK(BM_chain_1024_1_true)->Threads(1);
+BENCHMARK(BM_chain_1024_1_false)->Threads(2);
+BENCHMARK(BM_chain_1024_1_true)->Threads(2);
+BENCHMARK(BM_chain_1024_1_false)->Threads(8);
+BENCHMARK(BM_chain_1024_1_true)->Threads(8);
+BENCHMARK(BM_chain_1024_10_false)->Threads(1);
+BENCHMARK(BM_chain_1024_10_true)->Threads(1);
+BENCHMARK(BM_chain_1024_10_false)->Threads(8);
+BENCHMARK(BM_chain_1024_10_true)->Threads(8);
+BENCHMARK(BM_chain_1024_100_false)->Threads(1);
+BENCHMARK(BM_chain_1024_100_true)->Threads(1);
+BENCHMARK(BM_chain_1024_100_false)->Threads(2);
+BENCHMARK(BM_chain_1024_100_true)->Threads(2);
+BENCHMARK(BM_chain_1024_100_false)->Threads(8);
+BENCHMARK(BM_chain_1024_100_true)->Threads(8);
+
+BENCHMARK(BM_chain_1M_1_false)->Threads(1);
+BENCHMARK(BM_chain_1M_1_true)->Threads(1);
+BENCHMARK(BM_chain_1M_1_false)->Threads(2);
+BENCHMARK(BM_chain_1M_1_true)->Threads(2);
+BENCHMARK(BM_chain_1M_1_false)->Threads(8);
+BENCHMARK(BM_chain_1M_1_true)->Threads(8);
+BENCHMARK(BM_chain_1M_10_false)->Threads(1);
+BENCHMARK(BM_chain_1M_10_true)->Threads(1);
+BENCHMARK(BM_chain_1M_10_false)->Threads(8);
+BENCHMARK(BM_chain_1M_10_true)->Threads(8);
+BENCHMARK(BM_chain_1M_100_false)->Threads(1);
+BENCHMARK(BM_chain_1M_100_true)->Threads(1);
+BENCHMARK(BM_chain_1M_100_false)->Threads(2);
+BENCHMARK(BM_chain_1M_100_true)->Threads(2);
+BENCHMARK(BM_chain_1M_100_false)->Threads(8);
+BENCHMARK(BM_chain_1M_100_true)->Threads(8);
 #else
-static void BM_chain_1_false(int iters, int threads) {
-  BM_chain_ops(iters, 1, false, threads);
+static void BM_chain_1024_1_false(int iters, int threads) {
+  BM_chain_ops(iters, 1024, 1, false, 0, threads);
 }
 
-static void BM_chain_1_true(int iters, int threads) {
-  BM_chain_ops(iters, 1, true, threads);
+static void BM_chain_1024_1_true(int iters, int threads) {
+  BM_chain_ops(iters, 1024, 1, true, 0, threads);
 }
 
-static void BM_chain_10_false(int iters, int threads) {
-  BM_chain_ops(iters, 10, false, threads);
+static void BM_chain_1024_10_false(int iters, int threads) {
+  BM_chain_ops(iters, 1024, 10, false, 0, threads);
 }
 
-static void BM_chain_10_true(int iters, int threads) {
-  BM_chain_ops(iters, 10, true, threads);
+static void BM_chain_1024_10_true(int iters, int threads) {
+  BM_chain_ops(iters, 1024, 10, true, 0, threads);
 }
 
-static void BM_chain_100_false(int iters, int threads) {
-  BM_chain_ops(iters, 100, false, threads);
+static void BM_chain_1024_100_false(int iters, int threads) {
+  BM_chain_ops(iters, 1024, 100, false, 0, threads);
 }
 
-static void BM_chain_100_true(int iters, int threads) {
-  BM_chain_ops(iters, 100, true, threads);
+static void BM_chain_1024_100_true(int iters, int threads) {
+  BM_chain_ops(iters, 1024, 100, true, 0, threads);
 }
 
-BENCHMARK(BM_chain_1_false)->Arg(1);
-BENCHMARK(BM_chain_1_true)->Arg(1);
-BENCHMARK(BM_chain_1_false)->Arg(2);
-BENCHMARK(BM_chain_1_true)->Arg(2);
-BENCHMARK(BM_chain_1_false)->Arg(8);
-BENCHMARK(BM_chain_1_true)->Arg(8);
-BENCHMARK(BM_chain_10_false)->Arg(1);
-BENCHMARK(BM_chain_10_true)->Arg(1);
-BENCHMARK(BM_chain_10_false)->Arg(8);
-BENCHMARK(BM_chain_10_true)->Arg(8);
-BENCHMARK(BM_chain_100_false)->Arg(1);
-BENCHMARK(BM_chain_100_true)->Arg(1);
-BENCHMARK(BM_chain_100_false)->Arg(8);
-BENCHMARK(BM_chain_100_true)->Arg(8);
+static void BM_chain_1M_1_false(int iters, int threads) {
+  BM_chain_ops(iters, 1 << 20, 1, false, 0, threads);
+}
+
+static void BM_chain_1M_1_true(int iters, int threads) {
+  BM_chain_ops(iters, 1 << 20, 1, true, 0, threads);
+}
+
+static void BM_chain_1M_10_false(int iters, int threads) {
+  BM_chain_ops(iters, 1 << 20, 10, false, 0, threads);
+}
+
+static void BM_chain_1M_10_true(int iters, int threads) {
+  BM_chain_ops(iters, 1 << 20, 10, true, 0, threads);
+}
+
+static void BM_chain_1M_100_false(int iters, int threads) {
+  BM_chain_ops(iters, 1 << 20, 100, false, 0, threads);
+}
+
+static void BM_chain_1M_100_true(int iters, int threads) {
+  BM_chain_ops(iters, 1 << 20, 100, true, 0, threads);
+}
+
+BENCHMARK(BM_chain_1024_1_false)->Arg(1);
+BENCHMARK(BM_chain_1024_1_true)->Arg(1);
+BENCHMARK(BM_chain_1024_1_false)->Arg(2);
+BENCHMARK(BM_chain_1024_1_true)->Arg(2);
+BENCHMARK(BM_chain_1024_1_false)->Arg(8);
+BENCHMARK(BM_chain_1024_1_true)->Arg(8);
+BENCHMARK(BM_chain_1024_10_false)->Arg(1);
+BENCHMARK(BM_chain_1024_10_true)->Arg(1);
+BENCHMARK(BM_chain_1024_10_false)->Arg(8);
+BENCHMARK(BM_chain_1024_10_true)->Arg(8);
+BENCHMARK(BM_chain_1024_100_false)->Arg(1);
+BENCHMARK(BM_chain_1024_100_true)->Arg(1);
+BENCHMARK(BM_chain_1024_100_false)->Arg(2);
+BENCHMARK(BM_chain_1024_100_true)->Arg(2);
+BENCHMARK(BM_chain_1024_100_false)->Arg(8);
+BENCHMARK(BM_chain_1024_100_true)->Arg(8);
+
+BENCHMARK(BM_chain_1M_1_false)->Arg(1);
+BENCHMARK(BM_chain_1M_1_true)->Arg(1);
+BENCHMARK(BM_chain_1M_1_false)->Arg(2);
+BENCHMARK(BM_chain_1M_1_true)->Arg(2);
+BENCHMARK(BM_chain_1M_1_false)->Arg(8);
+BENCHMARK(BM_chain_1M_1_true)->Arg(8);
+BENCHMARK(BM_chain_1M_10_false)->Arg(1);
+BENCHMARK(BM_chain_1M_10_true)->Arg(1);
+BENCHMARK(BM_chain_1M_10_false)->Arg(8);
+BENCHMARK(BM_chain_1M_10_true)->Arg(8);
+BENCHMARK(BM_chain_1M_100_false)->Arg(1);
+BENCHMARK(BM_chain_1M_100_true)->Arg(1);
+BENCHMARK(BM_chain_1M_100_false)->Arg(2);
+BENCHMARK(BM_chain_1M_100_true)->Arg(2);
+BENCHMARK(BM_chain_1M_100_false)->Arg(8);
+BENCHMARK(BM_chain_1M_100_true)->Arg(8);
 #endif
 }  // namespace
 }  // namespace tensorflow
 
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM

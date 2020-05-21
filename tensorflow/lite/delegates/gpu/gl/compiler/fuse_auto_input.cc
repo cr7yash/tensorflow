@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/lite/delegates/gpu/gl/compiler/fuse_auto_input.h"
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "absl/strings/str_cat.h"
@@ -99,6 +100,25 @@ TransformResult FuseAutoInput::ApplyToNode(Node* node, GraphFloat32* graph) {
     return {TransformStatus::SKIPPED, ""};
   }
 
+  // Skip fusions which will result in duplicate inputs, e.g. diamond shapes.
+  {
+    std::unordered_set<ValueId> all_inputs;
+    for (const auto& node_to_fuse : nodes_to_fuse) {
+      for (const auto& input : graph->FindInputs(node_to_fuse.first->id)) {
+        if (all_inputs.find(input->id) != all_inputs.end()) {
+          return {TransformStatus::SKIPPED, ""};
+        }
+        all_inputs.insert(input->id);
+      }
+    }
+    for (const auto& input : graph->FindInputs(node->id)) {
+      if (all_inputs.find(input->id) != all_inputs.end()) {
+        return {TransformStatus::SKIPPED, ""};
+      }
+      all_inputs.insert(input->id);
+    }
+  }
+
   // Break connections between current node and its inputs.
   for (auto value : graph->FindInputs(node->id)) {
     if (!graph->RemoveConsumer(node->id, value->id).ok()) {
@@ -179,6 +199,11 @@ TransformResult FuseAutoInput::ApplyToNode(Node* node, GraphFloat32* graph) {
         return {TransformStatus::INVALID, ""};
       }
       input_num++;
+    }
+
+    // Also rename all _h and _w parameters to the new names.
+    for (auto& param : attr.code.parameters) {
+      param.name = absl::StrReplaceAll(param.name, replacements);
     }
     attr.code.source_code =
         absl::StrReplaceAll(attr.code.source_code, replacements);
